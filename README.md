@@ -15,6 +15,38 @@ The system is designed with the following goals in mind:
 
 ---
 
+## Fork: Changes in This Version
+
+This is a fork of [omerhalid/Real-Time-Market-Data-Feed-Handler-and-Order-Matching-Engine](https://github.com/omerhalid/Real-Time-Market-Data-Feed-Handler-and-Order-Matching-Engine). The original design and code are by the original author. This fork adds:
+
+- **Build fixes**: the original did not compile (multiple-definition link error in `Timestamp.hpp`, use-before-declaration in `AsyncLogger.hpp`).
+- **Order types**: `Matcher::submitOrder` implements LIMIT, MARKET, IOC and FOK orders with price-time priority, executing at the resting order's price.
+- **Correctness fixes**: price-level depth was never reduced on partial fills; duplicate order ids silently corrupted the book.
+- **O(1) cancel and fill**: price levels are intrusive doubly linked lists with nodes from a pre-allocated pool (no hot-path heap allocation, `Order` stays 32 bytes), replacing `std::vector` queues that shifted on every removal.
+- **Tests and benchmark**: `tests/test_matching.cpp` (14 tests) and `benchmarks/bench_matching.cpp` (seeded 1M-operation order flow: 60% limit, 25% cancel, 7% IOC, 5% market, 3% FOK).
+
+### Benchmark: vector queues vs. intrusive lists
+
+Same seeded order flow, same 592,911 trades in both runs (Release build, WSL2, single run):
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| Throughput | 0.95M ops/s | 3.20M ops/s | 3.4x |
+| p50 latency | 238 ns | 157 ns | -34% |
+| p99 latency | 12,109 ns | 1,137 ns | 10.6x lower |
+| p99.9 latency | 30,840 ns | 3,269 ns | 9.4x lower |
+
+Latencies include ~20-30 ns of timer overhead. Results vary by machine; reproduce with:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/bin/test_matching
+./build/bin/bench_matching
+```
+
+---
+
 ## Features
 
 ### HFT-Optimized Core
