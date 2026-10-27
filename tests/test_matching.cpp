@@ -170,6 +170,51 @@ static void test_cancel_updates_book() {
     CHECK(!f.book.cancelOrder(2)); // Already gone
 }
 
+static void test_cancel_middle_preserves_fifo() {
+    Fixture f;
+    f.rest(1, false, 1, 100.0);
+    f.rest(2, false, 2, 100.0);
+    f.rest(3, false, 3, 100.0);
+    CHECK(f.book.cancelOrder(2)); // Unlink from the middle of the queue
+    CHECK(f.book.getOrderCountAtPrice(false, px(100.0)) == 2);
+    CHECK(f.book.getQuantityAtPrice(false, px(100.0)) == 4);
+    CHECK(f.submit(4, true, 4, 100.0) == 2);
+    CHECK(f.trades[0].sell_order_id == 1);
+    CHECK(f.trades[1].sell_order_id == 3);
+    CHECK(f.book.cancelOrder(3) == false); // Fully filled, already removed
+    f.rest(5, false, 7, 100.0);            // Level re-created after emptying
+    CHECK(f.book.getBestAskPrice() == px(100.0));
+    CHECK(f.book.getOrderCountAtPrice(false, px(100.0)) == 1);
+}
+
+static void test_duplicate_id_rejected() {
+    Fixture f;
+    f.rest(1, true, 10, 100.0);
+    CHECK(!f.book.addOrder(f.make(1, true, 5, 99.0)));
+    CHECK(f.book.orderCount() == 1);
+    CHECK(f.book.getQuantityAtPrice(true, px(99.0)) == 0);
+}
+
+static void test_node_reuse_across_many_cycles() {
+    // Recycles pool nodes across many add/cancel cycles; the book must stay consistent
+    Fixture f;
+    const OrderId n = 10'000;
+    for (OrderId id = 1; id <= n; ++id) {
+        f.rest(id, (id & 1) != 0, 1, (id & 1) ? 99.0 : 101.0);
+    }
+    CHECK(f.book.orderCount() == n);
+    for (OrderId id = 1; id <= n; id += 2) {
+        CHECK(f.book.cancelOrder(id));
+    }
+    for (OrderId id = n + 1; id <= n + n / 2; ++id) {
+        f.rest(id, true, 1, 98.0);
+    }
+    CHECK(f.book.orderCount() == n);
+    CHECK(f.book.getQuantityAtPrice(true, px(99.0)) == 0);
+    CHECK(f.book.getQuantityAtPrice(true, px(98.0)) == n / 2);
+    CHECK(f.book.getBestBidPrice() == px(98.0));
+}
+
 int main() {
     struct { const char* name; void (*fn)(); } tests[] = {
         {"time priority within level", test_time_priority_within_level},
@@ -183,6 +228,9 @@ int main() {
         {"FOK kills on insufficient liquidity", test_fok_kills_when_liquidity_insufficient},
         {"FOK fills across levels", test_fok_fills_across_levels},
         {"cancel updates book", test_cancel_updates_book},
+        {"cancel from middle preserves FIFO", test_cancel_middle_preserves_fifo},
+        {"duplicate id rejected", test_duplicate_id_rejected},
+        {"node reuse across many cycles", test_node_reuse_across_many_cycles},
     };
 
     for (const auto& t : tests) {

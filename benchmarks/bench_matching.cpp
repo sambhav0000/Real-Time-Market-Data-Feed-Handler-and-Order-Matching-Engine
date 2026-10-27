@@ -69,7 +69,7 @@ struct RunResult {
 
 // Orders live in `ops` (stable addresses), so the book only stores pointers
 RunResult run(std::vector<Op> ops, bool measure_each_op) {
-    OrderBook book;
+    OrderBook book(ops.size());  // Pre-size index and node pool: no rehash/alloc spikes
     Matcher matcher;
     matcher.setTradeLogging(false);
 

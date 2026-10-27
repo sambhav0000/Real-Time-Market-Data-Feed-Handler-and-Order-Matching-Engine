@@ -1,48 +1,109 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 #include <unordered_map>
 #include <map>
-#include <array>
-#include <atomic>
+#include <memory>
 #include "Order.hpp"
 #include "../utils/Timestamp.hpp"
 
-// Price ladder structure for HFT - O(1) price level access
-// Each price level maintains a FIFO queue of orders
+class PriceLevel;
+
+// Intrusive list node linking a resting order into its price level's FIFO queue.
+// Kept outside Order so Order stays 32 bytes.
+struct OrderNode {
+    Order* order = nullptr;
+    OrderNode* prev = nullptr;
+    OrderNode* next = nullptr;   // Also links free nodes inside OrderNodePool
+    PriceLevel* level = nullptr; // Stable: std::map never moves its nodes
+};
+
+// Pool of OrderNodes allocated in fixed-size chunks so node addresses stay stable.
+// After warm-up, allocate/release are O(1) and never touch the heap.
+class OrderNodePool {
+public:
+    static constexpr size_t CHUNK_SIZE = 4096;
+
+    explicit OrderNodePool(size_t initial_capacity = 0) {
+        while (capacity_ < initial_capacity) {
+            grow();
+        }
+    }
+
+    [[nodiscard]] OrderNode* allocate() noexcept {
+        if (!free_head_) [[unlikely]] {
+            grow();
+        }
+        OrderNode* node = free_head_;
+        free_head_ = node->next;
+        *node = OrderNode{};
+        return node;
+    }
+
+    void release(OrderNode* node) noexcept {
+        node->next = free_head_;
+        free_head_ = node;
+    }
+
+private:
+    std::vector<std::unique_ptr<OrderNode[]>> chunks_;
+    OrderNode* free_head_ = nullptr;
+    size_t capacity_ = 0;
+
+    void grow() {
+        chunks_.emplace_back(new OrderNode[CHUNK_SIZE]);
+        OrderNode* chunk = chunks_.back().get();
+        for (size_t i = 0; i < CHUNK_SIZE; ++i) {
+            chunk[i].next = free_head_;
+            free_head_ = &chunk[i];
+        }
+        capacity_ += CHUNK_SIZE;
+    }
+};
+
+// One price level: FIFO queue of orders as an intrusive doubly linked list.
+// Append, pop-front and removal from the middle (cancel) are all O(1).
 class PriceLevel {
 public:
-    PriceLevel() noexcept : total_quantity_(0), order_count_(0) {}
-    
-    // Add order to this price level (FIFO)
-    void addOrder(Order* order) noexcept {
-        orders_.push_back(order);
-        total_quantity_ += order->quantity;
+    PriceLevel() noexcept = default;
+
+    // Append order to the back of the queue (time priority)
+    void pushBack(OrderNode* node) noexcept {
+        node->prev = tail_;
+        node->next = nullptr;
+        if (tail_) {
+            tail_->next = node;
+        } else {
+            head_ = node;
+        }
+        tail_ = node;
+        total_quantity_ += node->order->quantity;
         order_count_++;
     }
-    
-    // Remove order by ID
-    bool removeOrder(OrderId id) noexcept {
-        for (auto it = orders_.begin(); it != orders_.end(); ++it) {
-            if ((*it)->id == id) [[likely]] {
-                total_quantity_ -= (*it)->quantity;
-                orders_.erase(it);
-                order_count_--;
-                return true;
-            }
+
+    // Unlink order from anywhere in the queue
+    void unlink(OrderNode* node) noexcept {
+        if (node->prev) {
+            node->prev->next = node->next;
+        } else {
+            head_ = node->next;
         }
-        return false;
+        if (node->next) {
+            node->next->prev = node->prev;
+        } else {
+            tail_ = node->prev;
+        }
+        total_quantity_ -= node->order->quantity;
+        order_count_--;
     }
-    
+
     // Get best order (FIFO - first in queue)
     [[nodiscard]] Order* getBestOrder() const noexcept {
-        if (orders_.empty()) [[unlikely]] {
-            return nullptr;
-        }
-        return orders_.front();
+        return head_ ? head_->order : nullptr;
     }
-    
+
     // Account for a partial or full fill of an order at this level
     void reduceQuantity(Quantity qty) noexcept {
         total_quantity_ -= qty;
@@ -52,120 +113,105 @@ public:
     [[nodiscard]] Quantity getTotalQuantity() const noexcept {
         return total_quantity_;
     }
-    
+
+    // Number of orders queued at this level
+    [[nodiscard]] size_t getOrderCount() const noexcept {
+        return order_count_;
+    }
+
     // Check if level is empty
     [[nodiscard]] bool isEmpty() const noexcept {
-        return orders_.empty();
-    }
-    
-    // Get all orders (for iteration)
-    [[nodiscard]] const std::vector<Order*>& getOrders() const noexcept {
-        return orders_;
+        return head_ == nullptr;
     }
 
 private:
-    std::vector<Order*> orders_;  // FIFO queue of orders at this price
-    Quantity total_quantity_;
-    size_t order_count_;
+    OrderNode* head_ = nullptr;
+    OrderNode* tail_ = nullptr;
+    Quantity total_quantity_ = 0;
+    size_t order_count_ = 0;
 };
 
 // HFT-optimized OrderBook using price ladder structure
-// Provides O(1) price level access and O(log P) best price lookup
+// O(log P) to add at a new price level, O(1) best price, and O(1) cancel/fill
+// (hash lookup + list unlink) independent of queue depth at the level.
 class OrderBook {
 public:
     static constexpr Price MIN_PRICE = 0;
     static constexpr Price MAX_PRICE = 10'000'000'000LL; // $10,000 scaled
     static constexpr Price TICK_SIZE = 1LL; // Minimum price increment (1 micro-dollar)
     static constexpr size_t MAX_PRICE_LEVELS = (MAX_PRICE - MIN_PRICE) / TICK_SIZE;
-    
-    OrderBook() noexcept {
-        // Maps don't support reserve(), but we can hint the allocator
-        // The map will grow as needed
+    static constexpr size_t DEFAULT_EXPECTED_ORDERS = 1 << 16;
+
+    // Pre-size the order index and node pool so the hot path avoids
+    // rehashing and heap allocation up to expected_orders resting orders
+    explicit OrderBook(size_t expected_orders = DEFAULT_EXPECTED_ORDERS)
+        : node_pool_(expected_orders) {
+        order_map_.reserve(expected_orders);
     }
-    
+
     // Add order to the book
-    // Returns true if order was added, false if invalid
+    // Returns false if the order is invalid or its id is already resting
     [[nodiscard]] bool addOrder(Order* order) noexcept {
         if (!order || order->quantity == 0) [[unlikely]] {
             return false;
         }
-        
+
+        auto [it, inserted] = order_map_.try_emplace(order->id, nullptr);
+        if (!inserted) [[unlikely]] {
+            return false; // Duplicate id would corrupt the book
+        }
+
         // Set timestamp if not already set
         if (order->timestamp_ns == 0) [[unlikely]] {
             order->timestamp_ns = hft::getTimestampNs();
         }
-        
-        // Store order in map for O(1) lookup
-        order_map_[order->id] = order;
-        
-        // Add to appropriate price ladder
-        Price price = order->price_scaled;
-        if (order->isBuy()) [[likely]] {
-            auto& level = buy_levels_[price];
-            level.addOrder(order);
+
+        PriceLevel& level = order->isBuy() ? buy_levels_[order->price_scaled]
+                                           : sell_levels_[order->price_scaled];
+        OrderNode* node = node_pool_.allocate();
+        node->order = order;
+        node->level = &level;
+        level.pushBack(node);
+        it->second = node;
+
+        if (order->isBuy()) {
             updateBestBid();
         } else {
-            auto& level = sell_levels_[price];
-            level.addOrder(order);
             updateBestAsk();
         }
-        
+
         return true;
     }
-    
+
     // Cancel order by ID
     [[nodiscard]] bool cancelOrder(OrderId id) noexcept {
         auto it = order_map_.find(id);
         if (it == order_map_.end()) [[unlikely]] {
             return false;
         }
-        
-        Order* order = it->second;
-        Price price = order->price_scaled;
-        
-        bool removed = false;
-        if (order->isBuy()) [[likely]] {
-            auto level_it = buy_levels_.find(price);
-            if (level_it != buy_levels_.end()) [[likely]] {
-                removed = level_it->second.removeOrder(id);
-                if (level_it->second.isEmpty()) [[unlikely]] {
-                    buy_levels_.erase(level_it);
-                }
-                updateBestBid();
-            }
-        } else {
-            auto level_it = sell_levels_.find(price);
-            if (level_it != sell_levels_.end()) [[likely]] {
-                removed = level_it->second.removeOrder(id);
-                if (level_it->second.isEmpty()) [[unlikely]] {
-                    sell_levels_.erase(level_it);
-                }
-                updateBestAsk();
-            }
-        }
-        
-        if (removed) [[likely]] {
-            order_map_.erase(it);
-        }
-        
-        return removed;
+
+        OrderNode* node = it->second;
+        order_map_.erase(it);
+        removeNode(node);
+        return true;
     }
 
     // Fill qty of a resting order: keeps the level's aggregate quantity in sync
     // and removes the order once it is fully filled
     void fillOrder(Order* order, Quantity qty) noexcept {
-        auto& levels = order->isBuy() ? buy_levels_ : sell_levels_;
-        auto level_it = levels.find(order->price_scaled);
-        if (level_it == levels.end()) [[unlikely]] {
+        auto it = order_map_.find(order->id);
+        if (it == order_map_.end()) [[unlikely]] {
             return;
         }
 
-        level_it->second.reduceQuantity(qty);
+        OrderNode* node = it->second;
+        node->level->reduceQuantity(qty);
         order->quantity -= qty;
 
         if (order->quantity == 0) {
-            // Quantity is already zero, so removeOrder leaves the level total unchanged
-            (void)cancelOrder(order->id);
+            // Quantity is already zero, so unlink leaves the level total unchanged
+            order_map_.erase(it);
+            removeNode(node);
         }
     }
 
@@ -198,33 +244,37 @@ public:
         return it == levels.end() ? 0 : it->second.getTotalQuantity();
     }
 
+    // Number of resting orders at a price level (0 if the level is empty)
+    [[nodiscard]] size_t getOrderCountAtPrice(bool buy_side, Price price) const noexcept {
+        const auto& levels = buy_side ? buy_levels_ : sell_levels_;
+        auto it = levels.find(price);
+        return it == levels.end() ? 0 : it->second.getOrderCount();
+    }
+
     // Number of resting orders in the book
     [[nodiscard]] size_t orderCount() const noexcept {
         return order_map_.size();
     }
 
-    // Modify order (cancel + add)
+    // Modify order (cancel + add); loses time priority
     [[nodiscard]] bool modifyOrder(OrderId id, Price new_price, Quantity new_quantity) noexcept {
-        auto it = order_map_.find(id);
-        if (it == order_map_.end()) [[unlikely]] {
+        Order* order = getOrder(id);
+        if (!order) [[unlikely]] {
             return false;
         }
-        
-        Order* order = it->second;
-        bool was_buy = order->isBuy();
-        
+
         // Cancel old order
-        cancelOrder(id);
-        
+        (void)cancelOrder(id);
+
         // Update order fields
         order->price_scaled = new_price;
         order->quantity = new_quantity;
         order->timestamp_ns = hft::getTimestampNs(); // Update timestamp
-        
+
         // Re-add with new parameters
         return addOrder(order);
     }
-    
+
     // Get best bid (highest buy price)
     [[nodiscard]] Order* getBestBid() const noexcept {
         if (buy_levels_.empty()) [[unlikely]] {
@@ -232,7 +282,7 @@ public:
         }
         return buy_levels_.rbegin()->second.getBestOrder();
     }
-    
+
     // Get best ask (lowest sell price)
     [[nodiscard]] Order* getBestAsk() const noexcept {
         if (sell_levels_.empty()) [[unlikely]] {
@@ -240,17 +290,17 @@ public:
         }
         return sell_levels_.begin()->second.getBestOrder();
     }
-    
+
     // Get best bid price
     [[nodiscard]] Price getBestBidPrice() const noexcept {
         return best_bid_price_;
     }
-    
+
     // Get best ask price
     [[nodiscard]] Price getBestAskPrice() const noexcept {
         return best_ask_price_;
     }
-    
+
     // Get spread (ask - bid)
     [[nodiscard]] Price getSpread() const noexcept {
         if (best_bid_price_ == 0 || best_ask_price_ == 0) [[unlikely]] {
@@ -258,18 +308,18 @@ public:
         }
         return best_ask_price_ - best_bid_price_;
     }
-    
+
     // Check if there's a match (bid >= ask)
     [[nodiscard]] bool hasMatch() const noexcept {
-        return best_bid_price_ > 0 && best_ask_price_ > 0 && 
+        return best_bid_price_ > 0 && best_ask_price_ > 0 &&
                best_bid_price_ >= best_ask_price_;
     }
-    
+
     // Get order by ID
     [[nodiscard]] Order* getOrder(OrderId id) const noexcept {
         auto it = order_map_.find(id);
         if (it != order_map_.end()) [[likely]] {
-            return it->second;
+            return it->second->order;
         }
         return nullptr;
     }
@@ -277,16 +327,38 @@ public:
 private:
     // Price ladder: sorted map from price to price level
     // Using std::map for O(log n) insertion but O(1) best price access via rbegin()/begin()
-    std::map<Price, PriceLevel> buy_levels_;  // Sorted descending (highest first)
-    std::map<Price, PriceLevel> sell_levels_; // Sorted ascending (lowest first)
-    
-    // Order lookup map
-    std::unordered_map<OrderId, Order*> order_map_;
-    
+    std::map<Price, PriceLevel> buy_levels_;  // Best bid at rbegin()
+    std::map<Price, PriceLevel> sell_levels_; // Best ask at begin()
+
+    // Order lookup: id -> list node, for O(1) cancel and fill
+    std::unordered_map<OrderId, OrderNode*> order_map_;
+    OrderNodePool node_pool_;
+
     // Cached best prices for O(1) access
     Price best_bid_price_ = 0;
     Price best_ask_price_ = 0;
-    
+
+    // Unlink a node from its level, erase the level if it empties, recycle the node.
+    // Caller has already removed the node from order_map_.
+    void removeNode(OrderNode* node) noexcept {
+        PriceLevel* level = node->level;
+        level->unlink(node);
+
+        if (level->isEmpty()) {
+            // Only an emptied level can change the best price
+            const Order* order = node->order;
+            if (order->isBuy()) {
+                buy_levels_.erase(order->price_scaled);
+                updateBestBid();
+            } else {
+                sell_levels_.erase(order->price_scaled);
+                updateBestAsk();
+            }
+        }
+
+        node_pool_.release(node);
+    }
+
     // Update cached best bid
     void updateBestBid() noexcept {
         if (buy_levels_.empty()) [[unlikely]] {
@@ -296,7 +368,7 @@ private:
         // Highest price is at rbegin()
         best_bid_price_ = buy_levels_.rbegin()->first;
     }
-    
+
     // Update cached best ask
     void updateBestAsk() noexcept {
         if (sell_levels_.empty()) [[unlikely]] {
