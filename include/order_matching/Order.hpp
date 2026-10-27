@@ -17,6 +17,14 @@ using Quantity = uint32_t;
 // Nanosecond timestamp (Linux clock_gettime)
 using Timestamp = int64_t;
 
+// Order types (stored in Order::order_type)
+namespace order_type {
+    constexpr uint8_t LIMIT  = 0; // Match what crosses, rest the remainder
+    constexpr uint8_t MARKET = 1; // Match at any price, discard the remainder
+    constexpr uint8_t IOC    = 2; // Immediate-or-cancel: limit price, discard the remainder
+    constexpr uint8_t FOK    = 3; // Fill-or-kill: fill entirely at limit price or not at all
+}
+
 // HFT-optimized Order structure - tightly packed, cache-aligned
 // Size: 32 bytes (fits in one cache line on most systems)
 struct alignas(32) Order {

@@ -116,6 +116,22 @@ set_target_properties(MarketDataEngine PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Unit tests (run with: ctest --test-dir build, or ./build/bin/test_matching)
+enable_testing()
+add_executable(test_matching tests/test_matching.cpp)
+target_link_libraries(test_matching PRIVATE Threads::Threads)
+set_target_properties(test_matching PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+add_test(NAME test_matching COMMAND test_matching)
+
+# Order-flow benchmark (run with: ./build/bin/bench_matching [num_ops])
+add_executable(bench_matching benchmarks/bench_matching.cpp)
+target_link_libraries(bench_matching PRIVATE Threads::Threads)
+set_target_properties(bench_matching PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Installation
 install(TARGETS MarketDataEngine
     RUNTIME DESTINATION bin

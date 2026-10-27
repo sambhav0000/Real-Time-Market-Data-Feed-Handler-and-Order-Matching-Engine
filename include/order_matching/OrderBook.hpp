@@ -43,6 +43,11 @@ public:
         return orders_.front();
     }
     
+    // Account for a partial or full fill of an order at this level
+    void reduceQuantity(Quantity qty) noexcept {
+        total_quantity_ -= qty;
+    }
+
     // Get total quantity at this level
     [[nodiscard]] Quantity getTotalQuantity() const noexcept {
         return total_quantity_;
@@ -145,7 +150,59 @@ public:
         
         return removed;
     }
-    
+
+    // Fill qty of a resting order: keeps the level's aggregate quantity in sync
+    // and removes the order once it is fully filled
+    void fillOrder(Order* order, Quantity qty) noexcept {
+        auto& levels = order->isBuy() ? buy_levels_ : sell_levels_;
+        auto level_it = levels.find(order->price_scaled);
+        if (level_it == levels.end()) [[unlikely]] {
+            return;
+        }
+
+        level_it->second.reduceQuantity(qty);
+        order->quantity -= qty;
+
+        if (order->quantity == 0) {
+            // Quantity is already zero, so removeOrder leaves the level total unchanged
+            (void)cancelOrder(order->id);
+        }
+    }
+
+    // Quantity available to an incoming order on the opposite side at prices
+    // that cross limit_price (any price if is_market). Stops early once
+    // `needed` is reached, so FOK checks only walk the levels they need.
+    [[nodiscard]] Quantity availableLiquidity(bool incoming_is_buy, Price limit_price,
+                                              bool is_market, Quantity needed) const noexcept {
+        Quantity available = 0;
+        if (incoming_is_buy) {
+            for (auto it = sell_levels_.begin(); it != sell_levels_.end(); ++it) {
+                if (!is_market && it->first > limit_price) break;
+                available += it->second.getTotalQuantity();
+                if (available >= needed) break;
+            }
+        } else {
+            for (auto it = buy_levels_.rbegin(); it != buy_levels_.rend(); ++it) {
+                if (!is_market && it->first < limit_price) break;
+                available += it->second.getTotalQuantity();
+                if (available >= needed) break;
+            }
+        }
+        return available;
+    }
+
+    // Total resting quantity at a price level (0 if the level is empty)
+    [[nodiscard]] Quantity getQuantityAtPrice(bool buy_side, Price price) const noexcept {
+        const auto& levels = buy_side ? buy_levels_ : sell_levels_;
+        auto it = levels.find(price);
+        return it == levels.end() ? 0 : it->second.getTotalQuantity();
+    }
+
+    // Number of resting orders in the book
+    [[nodiscard]] size_t orderCount() const noexcept {
+        return order_map_.size();
+    }
+
     // Modify order (cancel + add)
     [[nodiscard]] bool modifyOrder(OrderId id, Price new_price, Quantity new_quantity) noexcept {
         auto it = order_map_.find(id);
