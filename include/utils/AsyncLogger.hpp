@@ -30,6 +30,16 @@ enum class LogLevel : uint8_t {
     FATAL = 5
 };
 
+// Get thread ID (Linux-specific). Declared before LogMessage, which uses it.
+inline uint32_t getThreadId() noexcept {
+#ifdef __linux__
+    return static_cast<uint32_t>(syscall(SYS_gettid));
+#else
+    return static_cast<uint32_t>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+
 // Log message structure (cache-aligned for performance)
 struct alignas(64) LogMessage {
     LogLevel level;
@@ -249,15 +259,6 @@ private:
         return std::string(buffer);
     }
     
-    // Get thread ID (Linux-specific)
-    static uint32_t getThreadId() noexcept {
-#ifdef __linux__
-        return static_cast<uint32_t>(syscall(SYS_gettid));
-#else
-        return static_cast<uint32_t>(
-            std::hash<std::thread::id>{}(std::this_thread::get_id()));
-#endif
-    }
 };
 
 // Global logger instance (thread-safe for single producer)

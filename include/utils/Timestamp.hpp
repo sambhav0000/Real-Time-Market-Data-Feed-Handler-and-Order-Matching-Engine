@@ -102,12 +102,10 @@ public:
     }
 
 private:
-    static double cycles_per_ns_;
-    static double ns_per_cycle_;
+    // inline (C++17): defined once across all translation units including this header
+    static inline double cycles_per_ns_ = 2.5;  // Default: 2.5 GHz
+    static inline double ns_per_cycle_ = 0.4;
 };
-
-double RDTSCCalibrator::cycles_per_ns_ = 2.5;  // Default: 2.5 GHz
-double RDTSCCalibrator::ns_per_cycle_ = 0.4;
 
 // Get current timestamp in nanoseconds using RDTSC (ultra-fast)
 // For latency measurements - not wall-clock time
